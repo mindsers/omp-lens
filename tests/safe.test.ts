@@ -76,3 +76,51 @@ test("filter overrides cover every configured driver, dotted names included", ()
 	]);
 	expect(filterOverrides("")).toEqual([]);
 });
+
+test("a filter defined only in a submodule's own config is not run either", async () => {
+	const base = await realpath(await mkdtemp(join(tmpdir(), "lens-submodule-")));
+	made.push(base);
+	const env = { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@example.com", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@example.com" };
+	const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, env, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+	const marker = join(base, "PWNED");
+	const script = join(base, "evil.sh");
+	await writeFile(script, `#!/bin/sh\ntouch "${marker}"\ncat\n`);
+	await chmod(script, 0o755);
+
+	const lib = join(base, "lib");
+	execFileSync("mkdir", [lib]);
+	git(lib, "init", "-q", ".");
+	await writeFile(join(lib, ".gitattributes"), "*.txt filter=subevil\n");
+	await writeFile(join(lib, "a.txt"), "x\n");
+	git(lib, "add", "-A");
+	git(lib, "commit", "-qm", "lib");
+
+	const root = join(base, "super");
+	execFileSync("mkdir", [root]);
+	git(root, "init", "-q", ".");
+	await writeFile(join(root, "s.txt"), "y\n");
+	git(root, "add", "-A");
+	git(root, "commit", "-qm", "super");
+	git(root, "-c", "protocol.file.allow=always", "submodule", "add", "-q", lib, "sub");
+	git(root, "commit", "-qm", "add sub");
+	git(join(root, "sub"), "config", "filter.subevil.clean", script);
+	await Bun.sleep(1100); // a same-size edit with a newer mtime makes git re-hash the file, through the filter
+	await writeFile(join(root, "sub", "a.txt"), "q\n");
+
+	await gitInfo(root);
+	await fileDiff(root, join(root, "sub"));
+	const from = await snapshotTree(root);
+	await changedBetween(root, from, await snapshotTree(root));
+	expect(await exists(marker)).toBe(false);
+	git(root, "status", "--porcelain"); // plain git does run it: the test would notice if the setup stopped triggering it
+	expect(await exists(marker)).toBe(true);
+});
+
+test("fails closed: when the repository's config cannot be read, no git command runs there", async () => {
+	const root = await realpath(await mkdtemp(join(tmpdir(), "lens-badconfig-")));
+	made.push(root);
+	execFileSync("git", ["init", "-q", "."], { cwd: root });
+	await writeFile(join(root, ".git", "config"), "[core\nthis is not config\n");
+	await expect(gitInfo(root)).rejects.toThrow();
+	await expect(snapshotTree(root)).rejects.toThrow();
+});

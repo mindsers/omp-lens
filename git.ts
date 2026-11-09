@@ -14,7 +14,8 @@ export const MAX_UNTRACKED_SNAPSHOT_BYTES = 10 * 1024 * 1024;
 /**
  * Options for every git call. `.git/config` is not always the user's own (an extracted archive, a shared folder),
  * and some settings name programs for git to run: never let them. `core.fsmonitor` is turned off here, filter
- * drivers by `safetyArgs`, and diffs pass --no-ext-diff and --no-textconv.
+ * drivers by `safetyArgs`; diffs pass --no-ext-diff and --no-textconv, and status and diffs pass
+ * --ignore-submodules=all, since a submodule's own config (with filters of its own) would apply inside it.
  */
 export const GIT_SAFETY = ["-c", "core.quotepath=false", "-c", "core.fsmonitor=false"];
 
@@ -45,18 +46,14 @@ export function filterOverrides(configOut: string): string[] {
 	return [...names].flatMap(name => ["clean", "smudge", "process"].flatMap(k => ["-c", `filter.${name}.${k}=`]).concat("-c", `filter.${name}.required=false`));
 }
 
-const SAFETY_TTL_MS = 5_000;
-const safetyCache = new Map<string, { args: Promise<string[]>; at: number }>();
-
-/** GIT_SAFETY plus the filter overrides for the repository at `cwd`. Reading config runs nothing. */
-export function safetyArgs(cwd: string): Promise<string[]> {
-	const cached = safetyCache.get(cwd);
-	if (cached && Date.now() - cached.at < SAFETY_TTL_MS) return cached.args;
-	const args = run(cwd, [...GIT_SAFETY, "config", "--get-regexp", "^filter\\."], process.env, [0, 1]) // 1: no match
-		.then(out => [...GIT_SAFETY, ...filterOverrides(out)])
-		.catch(() => GIT_SAFETY);
-	safetyCache.set(cwd, { args, at: Date.now() });
-	return args;
+/**
+ * GIT_SAFETY plus the filter overrides for the repository at `cwd`. Reading config runs nothing. Read afresh for
+ * every call, so a driver added meanwhile is covered too. Fails closed: when the config cannot be read, the git
+ * call is not made.
+ */
+export async function safetyArgs(cwd: string): Promise<string[]> {
+	const out = await run(cwd, [...GIT_SAFETY, "config", "--get-regexp", "^filter\\."], process.env, [0, 1]); // 1: no filters
+	return [...GIT_SAFETY, ...filterOverrides(out)];
 }
 
 async function git(cwd: string, args: string[], env: NodeJS.ProcessEnv = process.env, okCodes: number[] = [0]): Promise<string> {
@@ -122,7 +119,7 @@ export function parseStatus(out: string, root: string): Pick<GitInfo, "changed" 
 export async function gitInfo(root: string): Promise<GitInfo> {
 	// GIT_OPTIONAL_LOCKS=0: never contend with the agent's own git commands for index.lock.
 	const env = { ...process.env, GIT_OPTIONAL_LOCKS: "0" };
-	const out = await git(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all"], env);
+	const out = await git(root, ["status", "--porcelain=v1", "-z", "--untracked-files=all", "--ignore-submodules=all"], env);
 	return { root, ...parseStatus(out, root) };
 }
 
@@ -162,9 +159,21 @@ async function largeUntracked(root: string, env: NodeJS.ProcessEnv, maxBytes: nu
 }
 
 /**
+ * Submodules (gitlink entries) in the index, repo-relative. `git add -A` looks inside a submodule it already
+ * tracks, under the submodule's own config, filter drivers included; and `add` has no --ignore-submodules.
+ */
+async function gitlinks(root: string, env: NodeJS.ProcessEnv): Promise<string[]> {
+	const out = await git(root, ["ls-files", "-z", "--stage"], env);
+	return out
+		.split("\0")
+		.filter(record => record.startsWith("160000 "))
+		.map(record => record.slice(record.indexOf("\t") + 1));
+}
+
+/**
  * Hash the whole working tree (tracked + untracked, honouring .gitignore) into a tree object
  * using a throwaway copy of the index, so the user's staging area is never touched.
- * Untracked files above `maxUntrackedBytes` are left out.
+ * Untracked files above `maxUntrackedBytes` are left out, and submodules stay at the commit the index records.
  */
 export async function snapshotTree(root: string, maxUntrackedBytes = MAX_UNTRACKED_SNAPSHOT_BYTES): Promise<string> {
 	const indexPath = (await git(root, ["rev-parse", "--path-format=absolute", "--git-path", "index"])).trim();
@@ -173,7 +182,7 @@ export async function snapshotTree(root: string, maxUntrackedBytes = MAX_UNTRACK
 		const tmpIndex = join(tmp, "index");
 		await copyFile(indexPath, tmpIndex).catch(() => undefined); // a fresh repo has no index yet
 		const env = { ...process.env, GIT_INDEX_FILE: tmpIndex };
-		const skip = await largeUntracked(root, env, maxUntrackedBytes);
+		const skip = [...(await largeUntracked(root, env, maxUntrackedBytes)), ...(await gitlinks(root, env))];
 		if (skip.length === 0) await git(root, ["add", "-A"], env);
 		else {
 			// Pathspecs go through a file: there may be too many for a command line. `literal` keeps names with * or ? exact.
@@ -230,7 +239,7 @@ export function parseNameStatus(out: string, root: string): { status: string; pa
 
 /** Files that differ between two snapshots (git tree ids), as absolute path → one-letter status. */
 export async function changedBetween(root: string, from: string, to: string): Promise<Map<string, string>> {
-	const out = await git(root, ["diff", "--no-ext-diff", "--no-textconv", "--name-status", "-z", "-M", from, to]);
+	const out = await git(root, ["diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "--name-status", "-z", "-M", from, to]);
 	return new Map(parseNameStatus(out, root).map(f => [f.path, f.status]));
 }
 
@@ -238,9 +247,9 @@ async function diffTrees(root: string, from: string): Promise<EditDiff | null> {
 	const to = await snapshotTree(root);
 	if (to === from) return null;
 	const [status, numstat, patch] = await Promise.all([
-		git(root, ["diff", "--no-ext-diff", "--no-textconv", "--name-status", "-z", "-M", from, to]),
-		git(root, ["diff", "--no-ext-diff", "--no-textconv", "--numstat", "-M", from, to]),
-		git(root, ["diff", "--no-color", "--no-ext-diff", "--no-textconv", "-M", from, to]),
+		git(root, ["diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "--name-status", "-z", "-M", from, to]),
+		git(root, ["diff", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "--numstat", "-M", from, to]),
+		git(root, ["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", "-M", from, to]),
 	]);
 	const files = parseNameStatus(status, root);
 	let added = 0;
@@ -294,7 +303,7 @@ export async function fileDiff(root: string, path: string, range?: { from: strin
 	const env = { ...process.env, GIT_OPTIONAL_LOCKS: "0" };
 	const revs = range ? [range.from, range.to] : ["HEAD"];
 	try {
-		return await git(root, ["diff", "--no-color", "--no-ext-diff", "--no-textconv", ...revs, "--", path], env);
+		return await git(root, ["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", ...revs, "--", path], env);
 	} catch {
 		return "";
 	}

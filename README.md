@@ -136,7 +136,9 @@ while your editor is open. Add such files to `.gitignore`.
   file cannot send escape sequences to your terminal. The agent still receives your edit's diff unchanged.
 - git runs with `core.fsmonitor` and every configured filter driver disabled, and diffs run without external
   diff or textconv drivers, so a repository's `.git/config` cannot make the plugin run a program. One side
-  effect: a git-lfs file the agent changes is snapshotted with its content rather than its LFS pointer.
+  effect: a git-lfs file the agent changes is snapshotted with its content rather than its LFS pointer. If the
+  repository's config cannot be read, the plugin runs no git command there. Submodules are not looked inside
+  (their own config would apply there), so changes within a submodule get no marker.
   git's own `safe.directory` check still refuses repositories owned by another user.
 
 ## Development
