@@ -126,18 +126,18 @@ while your editor is open. Add such files to `.gitignore`.
   assumes omp's default extension handler timeout (30 s); with a lower `extensionHandlerTimeout`, a slow snapshot
   is abandoned sooner.
 - Special files (named pipes, devices, sockets) are listed but not previewed.
+- Outside a git repository, find skips hidden entries and `node_modules`, `dist`, `build`, `target`, `venv`,
+  `__pycache__`, `site-packages` and `coverage`, and lists at most 50,000 files. Text search takes a fixed
+  string, not a regex, and ignores case unless the query has a capital letter.
 
 ## Security
 
 - File contents, file names and search hits are drawn with control characters made visible (`␛`, `␇`…), so a
   file cannot send escape sequences to your terminal. The agent still receives your edit's diff unchanged.
-- git runs with `core.fsmonitor` disabled and diffs run without external diff or textconv drivers, so a
-  repository's `.git/config` cannot make the plugin run a program that way. Snapshots use `git add`, which
-  applies the repository's clean filters (git-lfs, for example), exactly as running `git add` yourself would.
+- git runs with `core.fsmonitor` and every configured filter driver disabled, and diffs run without external
+  diff or textconv drivers, so a repository's `.git/config` cannot make the plugin run a program. One side
+  effect: a git-lfs file the agent changes is snapshotted with its content rather than its LFS pointer.
   git's own `safe.directory` check still refuses repositories owned by another user.
-- Outside a git repository, find skips hidden entries and `node_modules`, `dist`, `build`, `target`, `venv`,
-  `__pycache__`, `site-packages` and `coverage`, and lists at most 50,000 files. Text search takes a fixed
-  string, not a regex, and ignores case unless the query has a capital letter.
 
 ## Development
 

@@ -12,21 +12,55 @@ const MAX_SNAPSHOT_FILE_BYTES = 2 * 1024 * 1024;
 export const MAX_UNTRACKED_SNAPSHOT_BYTES = 10 * 1024 * 1024;
 
 /**
- * Options for every git call. `core.fsmonitor` can name a program for git to run, and `.git/config` is not
- * always the user's own (an extracted archive, a shared folder): never let it. Diffs also pass --no-ext-diff
- * and --no-textconv for the same reason.
+ * Options for every git call. `.git/config` is not always the user's own (an extracted archive, a shared folder),
+ * and some settings name programs for git to run: never let them. `core.fsmonitor` is turned off here, filter
+ * drivers by `safetyArgs`, and diffs pass --no-ext-diff and --no-textconv.
  */
 export const GIT_SAFETY = ["-c", "core.quotepath=false", "-c", "core.fsmonitor=false"];
 
-function git(cwd: string, args: string[], env: NodeJS.ProcessEnv = process.env, okCodes: number[] = [0]): Promise<string> {
+function run(cwd: string, args: string[], env: NodeJS.ProcessEnv, okCodes: number[]): Promise<string> {
 	const { promise, resolve, reject } = Promise.withResolvers<string>();
-	execFile("git", [...GIT_SAFETY, ...args], { cwd, env, maxBuffer: MAX_BUFFER, encoding: "utf8" }, (err, stdout) => {
+	execFile("git", args, { cwd, env, maxBuffer: MAX_BUFFER, encoding: "utf8" }, (err, stdout) => {
 		if (!err) return resolve(stdout);
 		// A non-zero exit the caller declared acceptable (e.g. `diff --no-index` exits 1 on differences).
 		if (typeof err.code === "number" && okCodes.includes(err.code)) return resolve(stdout);
 		reject(err);
 	});
 	return promise;
+}
+
+/**
+ * `-c` overrides that disable every filter driver configured for `cwd`. The snapshots run `git add` on their own
+ * at each agent turn, and `git add` (like status and diff) runs a driver's clean or process program on the files
+ * its .gitattributes binds. Blank commands turn a driver off and `required=false` keeps git from failing for it.
+ * Side effect: a changed git-lfs file is snapshotted with its content rather than its pointer.
+ */
+export function filterOverrides(configOut: string): string[] {
+	const names = new Set<string>();
+	for (const line of configOut.split("\n")) {
+		const key = line.split(/\s/, 1)[0];
+		const m = /^filter\.(.+)\.[^.]+$/.exec(key);
+		if (m) names.add(m[1]);
+	}
+	return [...names].flatMap(name => ["clean", "smudge", "process"].flatMap(k => ["-c", `filter.${name}.${k}=`]).concat("-c", `filter.${name}.required=false`));
+}
+
+const SAFETY_TTL_MS = 5_000;
+const safetyCache = new Map<string, { args: Promise<string[]>; at: number }>();
+
+/** GIT_SAFETY plus the filter overrides for the repository at `cwd`. Reading config runs nothing. */
+export function safetyArgs(cwd: string): Promise<string[]> {
+	const cached = safetyCache.get(cwd);
+	if (cached && Date.now() - cached.at < SAFETY_TTL_MS) return cached.args;
+	const args = run(cwd, [...GIT_SAFETY, "config", "--get-regexp", "^filter\\."], process.env, [0, 1]) // 1: no match
+		.then(out => [...GIT_SAFETY, ...filterOverrides(out)])
+		.catch(() => GIT_SAFETY);
+	safetyCache.set(cwd, { args, at: Date.now() });
+	return args;
+}
+
+async function git(cwd: string, args: string[], env: NodeJS.ProcessEnv = process.env, okCodes: number[] = [0]): Promise<string> {
+	return run(cwd, [...(await safetyArgs(cwd)), ...args], env, okCodes);
 }
 
 // ── Status ────────────────────────────────────────────────────────────────
