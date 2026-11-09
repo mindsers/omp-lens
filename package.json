@@ -1,0 +1,29 @@
+{
+	"name": "omp-lens",
+	"version": "0.1.0",
+	"description": "File browser for omp: syntax-highlighted preview, line-range references, repo-wide find, review of the agent's changes, and edit-in-your-editor with the agent told what changed",
+	"keywords": ["omp-plugin", "oh-my-pi", "omp", "file-browser", "code-review"],
+	"license": "MIT",
+	"author": "mindsers",
+	"homepage": "https://github.com/mindsers/omp-lens#readme",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/mindsers/omp-lens.git"
+	},
+	"bugs": {
+		"url": "https://github.com/mindsers/omp-lens/issues"
+	},
+	"type": "module",
+	"omp": {
+		"extensions": ["./index.ts"]
+	},
+	"files": ["*.ts", "README.md", "LICENSE", "CHANGELOG.md"],
+	"scripts": {
+		"test": "bun test tests",
+		"typecheck": "tsc -p ."
+	},
+	"devDependencies": {
+		"@types/node": "^22",
+		"typescript": "^5"
+	}
+}
