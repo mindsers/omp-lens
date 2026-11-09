@@ -5,6 +5,7 @@ import { Text } from "@oh-my-pi/pi-tui";
 import { editorCommand } from "./editor-args.ts";
 import { type EditDiff, type Snapshot, diffSince, takeSnapshot } from "./git.ts";
 import type { CommandContext, ExtensionApi, Tui } from "./host.ts";
+import { safeText } from "./safe.ts";
 
 const MAX_PATCH_CHARS = 50_000;
 const EDIT_MESSAGE_TYPE = "lens.user-edit";
@@ -35,7 +36,8 @@ function describe(diff: EditDiff, cwd: string): string {
  */
 export function registerEditRenderer(pi: ExtensionApi): void {
 	pi.registerMessageRenderer(EDIT_MESSAGE_TYPE, (message, { expanded }, theme) => {
-		const text = typeof message.content === "string" ? message.content : "";
+		// The agent gets the raw diff; the transcript draws a terminal-safe copy.
+		const text = safeText(typeof message.content === "string" ? message.content : "");
 		if (expanded) return new Text(text, 1, 0);
 		const summary = text.split("\n").find(line => line.startsWith(SUMMARY_PREFIX));
 		const detail = summary ? summary.slice(SUMMARY_PREFIX.length) : "";

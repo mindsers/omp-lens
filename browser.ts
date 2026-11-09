@@ -9,6 +9,7 @@ import { type GitInfo, type TreeRange, gitInfo, listFiles, repoRoot } from "./gi
 import type { Component, Theme, Tui } from "./host.ts";
 import { lineRange, nearestLineNo } from "./lines.ts";
 import { type Preview, type PreviewMode, isMarkdown, loadPreview } from "./preview.ts";
+import { safeText } from "./safe.ts";
 import type { FileRef } from "./refs.ts";
 import { grepText, walkFiles } from "./search.ts";
 
@@ -634,11 +635,12 @@ export class FileBrowser implements Component {
 		const t = this.theme;
 		const hit = entry.hit;
 		if (hit) {
-			const plain = truncateToWidth(`${entry.name}  ${hit.text}`, room);
-			const cut = Math.min(plain.length, entry.name.length);
+			const name = safeText(entry.name);
+			const plain = truncateToWidth(`${name}  ${hit.text}`, room);
+			const cut = Math.min(plain.length, name.length);
 			return { plain, styled: t.fg("accent", plain.slice(0, cut)) + t.fg("dim", plain.slice(cut)) };
 		}
-		const plain = truncateToWidth(entry.name, room);
+		const plain = truncateToWidth(safeText(entry.name), room);
 		const slash = plain.lastIndexOf("/") + 1;
 		return { plain, styled: t.fg("dim", plain.slice(0, slash)) + plain.slice(slash) };
 	}
@@ -940,7 +942,7 @@ export class FileBrowser implements Component {
 		const sel = this.focus === "preview" && this.pvAnchor !== undefined ? this.selection() : undefined;
 		const selecting = sel ? ` · selecting L${sel.from}${sel.to === sel.from ? "" : `-${sel.to}`}` : "";
 		const badge = this.focus === "preview" ? `${t.fg("success", "LINES")} ` : "";
-		const caption = entry ? ` ${badge}${t.fg("accent", entry.name)}  ${t.fg("dim", pv ? `${pv.note}${where}${selecting}` : "loading…")}` : "";
+		const caption = entry ? ` ${badge}${t.fg("accent", safeText(entry.name))}  ${t.fg("dim", pv ? `${pv.note}${where}${selecting}` : "loading…")}` : "";
 		const out = [this.cell(caption, w)];
 
 		const lo = Math.min(this.pvAnchor ?? this.pvCursor, this.pvCursor);
@@ -993,7 +995,7 @@ export class FileBrowser implements Component {
 		const border = (s: string) => t.fg("border", s);
 		const row = (s: string) => border("│") + this.cell(s, inner) + border("│");
 
-		let title = this.state.path;
+		let title = safeText(this.state.path);
 		const maxTitle = lw - 4;
 		if (visibleWidth(title) > maxTitle) {
 			while (title.length > 1 && visibleWidth(title) > maxTitle - 1) title = title.slice(1);
@@ -1022,7 +1024,7 @@ export class FileBrowser implements Component {
 			const selected = this.top + i === this.sel;
 			const marked = this.state.marks.has(entry.path);
 			const gitMark = this.gitMark(entry);
-			const name = entry.isDirectory ? `${entry.name}${entry.name === ".." ? "" : "/"}` : entry.name;
+			const name = safeText(entry.isDirectory ? `${entry.name}${entry.name === ".." ? "" : "/"}` : entry.name);
 			const size = entry.isDirectory || finder ? "" : formatSize(entry.size);
 			const agentMark = this.agentMark(entry);
 			const room = lw - 7 - visibleWidth(size) - 1;
@@ -1055,8 +1057,8 @@ export class FileBrowser implements Component {
 		out.push(border(`├${"─".repeat(lw)}${side ? `┴${"─".repeat(pw)}` : ""}┤`));
 		const entry = this.current();
 		const parts: string[] = [];
-		if (this.flash) parts.push(t.fg("warning", this.flash));
-		else if (entry) parts.push(t.fg("accent", `${entry.isDirectory ? "DIR" : "FILE"} ${entry.name}`));
+		if (this.flash) parts.push(t.fg("warning", safeText(this.flash)));
+		else if (entry) parts.push(t.fg("accent", `${entry.isDirectory ? "DIR" : "FILE"} ${safeText(entry.name)}`));
 		if (this.state.marks.size > 0) parts.push(t.fg("success", `${this.state.marks.size} marked`));
 		if (this.loading) parts.push(t.fg("muted", "loading…"));
 		out.push(row(` ${parts.join("  ")}`));

@@ -2,6 +2,7 @@ import { spawn } from "node:child_process";
 import type { Dirent } from "node:fs";
 import { readdir } from "node:fs/promises";
 import { join } from "node:path";
+import { GIT_SAFETY } from "./git.ts";
 
 /**
  * Directories not worth indexing or searching outside a git repository, where there is no .gitignore to
@@ -91,7 +92,7 @@ export function runCapped(cmd: string, args: string[], cwd: string, maxLines: nu
 export async function grepText(cwd: string, query: string, inRepo: boolean, ripgrep = true): Promise<string> {
 	const ignoreCase = query === query.toLowerCase();
 	if (inRepo) {
-		const args = ["-c", "core.quotepath=false", "grep", "-n", "-z", "-I", "-F", "--untracked", ...(ignoreCase ? ["-i"] : []), "-e", query];
+		const args = [...GIT_SAFETY, "grep", "-n", "-z", "-I", "-F", "--untracked", ...(ignoreCase ? ["-i"] : []), "-e", query];
 		return (await runCapped("git", args, cwd, SEARCH_MAX_LINES, SEARCH_TIMEOUT_MS)) ?? "";
 	}
 	const skip = Object.keys(SKIP_DIRS);

@@ -11,9 +11,16 @@ const MAX_SNAPSHOT_FILE_BYTES = 2 * 1024 * 1024;
  */
 export const MAX_UNTRACKED_SNAPSHOT_BYTES = 10 * 1024 * 1024;
 
+/**
+ * Options for every git call. `core.fsmonitor` can name a program for git to run, and `.git/config` is not
+ * always the user's own (an extracted archive, a shared folder): never let it. Diffs also pass --no-ext-diff
+ * and --no-textconv for the same reason.
+ */
+export const GIT_SAFETY = ["-c", "core.quotepath=false", "-c", "core.fsmonitor=false"];
+
 function git(cwd: string, args: string[], env: NodeJS.ProcessEnv = process.env, okCodes: number[] = [0]): Promise<string> {
 	const { promise, resolve, reject } = Promise.withResolvers<string>();
-	execFile("git", ["-c", "core.quotepath=false", ...args], { cwd, env, maxBuffer: MAX_BUFFER, encoding: "utf8" }, (err, stdout) => {
+	execFile("git", [...GIT_SAFETY, ...args], { cwd, env, maxBuffer: MAX_BUFFER, encoding: "utf8" }, (err, stdout) => {
 		if (!err) return resolve(stdout);
 		// A non-zero exit the caller declared acceptable (e.g. `diff --no-index` exits 1 on differences).
 		if (typeof err.code === "number" && okCodes.includes(err.code)) return resolve(stdout);
@@ -189,7 +196,7 @@ export function parseNameStatus(out: string, root: string): { status: string; pa
 
 /** Files that differ between two snapshots (git tree ids), as absolute path → one-letter status. */
 export async function changedBetween(root: string, from: string, to: string): Promise<Map<string, string>> {
-	const out = await git(root, ["diff", "--name-status", "-z", "-M", from, to]);
+	const out = await git(root, ["diff", "--no-ext-diff", "--no-textconv", "--name-status", "-z", "-M", from, to]);
 	return new Map(parseNameStatus(out, root).map(f => [f.path, f.status]));
 }
 
@@ -197,9 +204,9 @@ async function diffTrees(root: string, from: string): Promise<EditDiff | null> {
 	const to = await snapshotTree(root);
 	if (to === from) return null;
 	const [status, numstat, patch] = await Promise.all([
-		git(root, ["diff", "--name-status", "-z", "-M", from, to]),
-		git(root, ["diff", "--numstat", "-M", from, to]),
-		git(root, ["diff", "--no-color", "--no-ext-diff", "-M", from, to]),
+		git(root, ["diff", "--no-ext-diff", "--no-textconv", "--name-status", "-z", "-M", from, to]),
+		git(root, ["diff", "--no-ext-diff", "--no-textconv", "--numstat", "-M", from, to]),
+		git(root, ["diff", "--no-color", "--no-ext-diff", "--no-textconv", "-M", from, to]),
 	]);
 	const files = parseNameStatus(status, root);
 	let added = 0;
@@ -230,7 +237,7 @@ async function diffFile(path: string, before: Buffer | null): Promise<EditDiff |
 		await writeFile(join(tmp, "a", name), before ?? "");
 		await writeFile(join(tmp, "b", name), after ?? "");
 		// `git diff --no-index` exits 1 when the files differ.
-		const raw = await git(tmp, ["diff", "--no-index", "--no-color", "--", `a/${name}`, `b/${name}`], process.env, [0, 1]);
+		const raw = await git(tmp, ["diff", "--no-index", "--no-color", "--no-ext-diff", "--no-textconv", "--", `a/${name}`, `b/${name}`], process.env, [0, 1]);
 		const patch = raw.replaceAll(`a/a/${name}`, `a/${name}`).replaceAll(`b/b/${name}`, `b/${name}`);
 		let added = 0;
 		let removed = 0;
@@ -253,7 +260,7 @@ export async function fileDiff(root: string, path: string, range?: { from: strin
 	const env = { ...process.env, GIT_OPTIONAL_LOCKS: "0" };
 	const revs = range ? [range.from, range.to] : ["HEAD"];
 	try {
-		return await git(root, ["diff", "--no-color", "--no-ext-diff", ...revs, "--", path], env);
+		return await git(root, ["diff", "--no-color", "--no-ext-diff", "--no-textconv", ...revs, "--", path], env);
 	} catch {
 		return "";
 	}

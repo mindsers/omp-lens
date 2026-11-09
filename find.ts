@@ -1,3 +1,5 @@
+import { safeText } from "./safe.ts";
+
 const SEPARATORS = "/_-. ";
 
 /** Does `text[i]` start a word: after a separator, or a lower→UPPER camelCase step? */
@@ -74,7 +76,8 @@ export function parseGrep(out: string, limit: number): { hits: GrepHit[]; capped
 		if (!m) continue;
 		if (hits.length >= limit) return { hits, capped: true };
 		const path = nul >= 0 ? row.slice(0, nul) : m[1];
-		hits.push({ path: path.replace(/^\.\//, ""), line: Number(m[2]), text: m[3].trim().slice(0, MAX_HIT_TEXT) }); // grep -r prints "./path"
+		// grep -r prints "./path". The text is only ever displayed: make it terminal-safe here.
+		hits.push({ path: path.replace(/^\.\//, ""), line: Number(m[2]), text: safeText(m[3].trim().slice(0, MAX_HIT_TEXT)) });
 	}
 	return { hits, capped: false };
 }

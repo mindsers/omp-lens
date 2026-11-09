@@ -9,6 +9,7 @@ import { type TreeRange, fileDiff } from "./git.ts";
 import type { Theme } from "./host.ts";
 import { imageSize } from "./image.ts";
 import { prettyJson } from "./json.ts";
+import { safeText } from "./safe.ts";
 import type { PreviewLine } from "./lines.ts";
 
 export type { PreviewLine } from "./lines.ts";
@@ -60,7 +61,9 @@ export function isMarkdown(path: string): boolean {
 	return MARKDOWN_EXT[extname(path).slice(1).toLowerCase()] === true;
 }
 
-function highlight(text: string, lang: string | undefined, theme: Theme): string[] {
+/** Highlight `text`, made terminal-safe first: the highlighter's colours are the only escape codes let through. */
+function highlight(raw: string, lang: string | undefined, theme: Theme): string[] {
+	const text = safeText(raw);
 	let coloured = text;
 	if (lang) {
 		const colors = Object.fromEntries(Object.entries(PALETTE).map(([name, token]) => [name, theme.getFgAnsi(token)]));
@@ -70,7 +73,7 @@ function highlight(text: string, lang: string | undefined, theme: Theme): string
 			coloured = text; // unhighlightable input: show it plain rather than fail
 		}
 	}
-	return coloured.split("\n").map(line => line.replace(/\r$/, "").replaceAll("\t", "  "));
+	return coloured.split("\n").map(line => line.replaceAll("\t", "  "));
 }
 
 function languageFor(path: string): string | undefined {
@@ -112,7 +115,7 @@ async function imagePreview(entry: Entry, format: string): Promise<Preview> {
 
 async function directoryPreview(entry: Entry, theme: Theme): Promise<Preview> {
 	const items = (await listDirectory(entry.path, false)).filter(e => e.name !== "..");
-	const rows = items.slice(0, MAX_DIR_ITEMS).map(e => (e.isDirectory ? theme.fg("accent", `${e.name}/`) : e.name));
+	const rows = items.slice(0, MAX_DIR_ITEMS).map(e => (e.isDirectory ? theme.fg("accent", `${safeText(e.name)}/`) : safeText(e.name)));
 	const more = items.length > MAX_DIR_ITEMS ? ` · first ${MAX_DIR_ITEMS}` : "";
 	return plain(rows, items.length === 0 ? "empty directory" : `${items.length} items${more}`);
 }
@@ -123,7 +126,7 @@ function markdownPreview(text: string, truncated: boolean): Preview {
 		note: `markdown · rendered (view only)${truncated ? " · truncated" : ""}`,
 		gutter: "none",
 		numW: 1,
-		render: width => new Markdown(text, 0, 0, getMarkdownTheme()).render(Math.max(10, width)),
+		render: width => new Markdown(safeText(text), 0, 0, getMarkdownTheme()).render(Math.max(10, width)),
 	};
 }
 
@@ -155,7 +158,8 @@ async function fileContent(entry: Entry, mode: PreviewMode, theme: Theme): Promi
 /** A diff preview, or undefined when the patch has no hunks. */
 function diffPreview(patch: string, label: string, path: string, theme: Theme): Preview | undefined {
 	const lang = languageFor(path);
-	const parsed = parseUnifiedDiff(patch, code => highlight(code, lang, theme));
+	// hunk headers and "\ No newline" rows are drawn as they are, and a hunk header quotes the file: sanitise it all
+	const parsed = parseUnifiedDiff(safeText(patch), code => highlight(code, lang, theme));
 	if (!parsed) return undefined;
 	return build(parsed.lines.slice(0, MAX_LINES), `${label} · +${parsed.added} -${parsed.removed}`, "diff", { jump: parsed.jump });
 }
@@ -176,6 +180,6 @@ export async function loadPreview(entry: Entry, mode: PreviewMode, theme: Theme,
 		}
 		return await fileContent(entry, mode, theme);
 	} catch (err) {
-		return plain([], `cannot read: ${err instanceof Error ? err.message : String(err)}`);
+		return plain([], safeText(`cannot read: ${err instanceof Error ? err.message : String(err)}`));
 	}
 }
