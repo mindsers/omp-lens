@@ -17,7 +17,7 @@
 	"omp": {
 		"extensions": ["./index.ts"]
 	},
-	"files": ["*.ts", "README.md", "LICENSE", "CHANGELOG.md"],
+	"files": ["*.ts", "README.md", "LICENSE", "CHANGELOG.md", "SECURITY.md"],
 	"scripts": {
 		"test": "bun test tests",
 		"typecheck": "tsc -p ."

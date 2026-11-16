@@ -10,4 +10,7 @@ First public release.
 - `@path` and `@path#L12-20` references inserted into the prompt.
 - Edit in `$VISUAL` / `$EDITOR`; the diff of your edit is queued for the agent's next turn.
 - Review of the agent's changes per turn or per session, with its diff.
-- Untrusted text is drawn terminal-safe; git runs without fsmonitor, filter, external diff or textconv programs.
+- Agent-change tracking follows the session across `/new`, `/resume`, `/fork` and session-tree moves.
+- Untrusted text is drawn terminal-safe; git runs without fsmonitor, filter, external diff or textconv programs,
+  stays out of submodules, and runs nothing in a repository whose config cannot be read.
+- Failures (a search, a diff, git status, agent tracking) are shown, never passed off as empty results.
