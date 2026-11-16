@@ -113,3 +113,128 @@ test("leaving find returns to the entry selected before it started", async () =>
 	await b.until(() => b.screen().includes("FILE README.md"));
 	expect(s.finder).toBeUndefined();
 });
+
+// ── Preview ──────────────────────────────────────────────────────────────
+
+const { loadPreview } = await import("../preview.ts");
+
+async function previewOf(name: string, content: string | Buffer, mode: import("../preview.ts").PreviewMode = "file", gitRoot: string | null = null) {
+	const path = join(root, name);
+	await writeFile(path, content);
+	const size = typeof content === "string" ? Buffer.byteLength(content) : content.length;
+	return loadPreview({ name, path, isDirectory: false, size, mtimeMs: 0 }, mode, theme, gitRoot);
+}
+
+test("preview: escape sequences in a file never reach the terminal raw", async () => {
+	const p = await previewOf("evil.txt", "a\x1b]52;c;aGk=\x07b\n\x1b[2Jc\n");
+	const drawn = p.lines.map(l => l.text).join("\n");
+	expect(drawn).not.toContain("\x1b");
+	expect(drawn).toContain("␛");
+});
+
+test("preview: binary, empty and oversized files say so in the caption", async () => {
+	expect((await previewOf("bin.dat", Buffer.from([1, 0, 2]))).note).toContain("binary file");
+	expect((await previewOf("empty.txt", "")).note).toBe("empty file");
+	const long = await previewOf("long.txt", "x\n".repeat(3500));
+	expect(long.note).toContain("truncated");
+	expect(long.lines).toHaveLength(3000);
+});
+
+test("preview: a diff view of an unchanged file falls back to its content; a failed diff says why", async () => {
+	const clean = await previewOf("clean.txt", "same\n", "diff", root); // the repo has no commits: no diff
+	expect(clean.lines.map(l => l.text)).toEqual(["same"]);
+	expect(clean.note).not.toContain("diff unavailable");
+	const failed = await previewOf("clean.txt", "same\n", "diff", join(root, "no-such-dir"));
+	expect(failed.lines.map(l => l.text)).toEqual(["same"]);
+	expect(failed.note).toContain("diff unavailable");
+});
+
+// ── Browser state across reopenings ──────────────────────────────────────
+
+test("a remembered agent scope that no longer exists is dropped on reopen, not shown over the full list", async () => {
+	const s = state({ agentScope: "session", view: "agent" });
+	const b = open(s); // opened with no agent changes at all
+	await b.until(() => b.screen().includes("README.md"));
+	expect(s.agentScope).toBe("off");
+	expect(s.view).toBe("file");
+	expect(b.screen()).not.toContain("[agent:");
+});
+
+// ── /lens arguments ──────────────────────────────────────────────────────
+
+const { applyArgs, noAgentScope } = await import("../index.ts");
+
+function argsCtx() {
+	const notes: string[] = [];
+	return { notes, ctx: { mode: "tui", cwd: root, isIdle: () => true, ui: { notify: (m: string) => notes.push(m), custom: async () => undefined, pasteToEditor: () => undefined } } };
+}
+
+test("/lens <file> opens its folder with it selected; a dotfile turns on hidden files; a bad path is an error", async () => {
+	await writeFile(join(root, "src", ".hidden.ts"), "x\n");
+	const { ctx, notes } = argsCtx();
+	const s = state();
+	expect(await applyArgs("src/.hidden.ts", s, root, ctx)).toBe(true);
+	expect(s).toMatchObject({ path: join(root, "src"), selectedName: ".hidden.ts", showHidden: true });
+	expect(await applyArgs("nope/missing.ts", state(), root, ctx)).toBe(false);
+	expect(notes).toEqual(["No such file or folder: nope/missing.ts"]);
+});
+
+test("/lens changes explains why there is nothing to show", () => {
+	expect(noAgentScope({}, "last")).toContain("No agent changes recorded yet");
+	expect(noAgentScope({ error: "bad config" }, "last")).toBe("Agent-change tracking failed: bad config");
+	const last = { files: new Map(), dirs: new Set<string>(), range: { root, from: "a", to: "b", label: "" } };
+	expect(noAgentScope({ last }, "session")).toBe("The agent has no net changes this session.");
+	expect(noAgentScope({ last, sessionError: "bad object" }, "session")).toContain("unavailable");
+});
+
+// ── Edit in $EDITOR ──────────────────────────────────────────────────────
+
+const { editAndInform } = await import("../editmode.ts");
+
+async function runEdit(script: string, file: string, idle = true) {
+	const editor = join(root, "fake-editor.sh");
+	await writeFile(editor, `#!/bin/sh\n${script}\n`, { mode: 0o755 });
+	const sent: { content: string; deliverAs?: string }[] = [];
+	const notes: string[] = [];
+	const pi = { sendMessage: (m: { content: string }, o?: { deliverAs?: string }) => sent.push({ content: m.content, deliverAs: o?.deliverAs }) };
+	const ctx = { mode: "tui", cwd: root, isIdle: () => idle, ui: { notify: (m: string) => notes.push(m), custom: async () => undefined, pasteToEditor: () => undefined } };
+	const saved = process.env.VISUAL;
+	process.env.VISUAL = editor;
+	try {
+		const ok = await editAndInform(pi as never, ctx, { requestRender: () => undefined }, file, root);
+		return { ok, sent, notes };
+	} finally {
+		if (saved === undefined) delete process.env.VISUAL;
+		else process.env.VISUAL = saved;
+	}
+}
+
+test("edit: a saved change is sent to the agent for its next turn", async () => {
+	const file = join(root, "edited.txt");
+	await writeFile(file, "one\n");
+	const r = await runEdit(`echo two >> "$1"`, file);
+	expect(r.ok).toBe(true);
+	expect(r.sent).toHaveLength(1);
+	expect(r.sent[0].deliverAs).toBe("nextTurn");
+	expect(r.sent[0].content).toContain("Changed files (1, +1 -0): M edited.txt");
+	expect(r.sent[0].content).toContain("+two");
+});
+
+test("edit: no change sends nothing; a busy agent or a missing editor stops before anything runs", async () => {
+	const file = join(root, "README.md");
+	expect(await runEdit("true", file)).toMatchObject({ sent: [], notes: ["No changes."] });
+	const busy = await runEdit(`echo x >> "$1"`, file, false);
+	expect(busy.ok).toBe(false);
+	expect(busy.notes[0]).toContain("still working");
+	const saved = process.env.VISUAL;
+	process.env.VISUAL = join(root, "no-such-editor");
+	try {
+		const notes: string[] = [];
+		const ctx = { mode: "tui", cwd: root, isIdle: () => true, ui: { notify: (m: string) => notes.push(m), custom: async () => undefined, pasteToEditor: () => undefined } };
+		expect(await editAndInform({ sendMessage: () => undefined } as never, ctx, { requestRender: () => undefined }, file, root)).toBe(false);
+		expect(notes[0]).toContain("Could not run");
+	} finally {
+		if (saved === undefined) delete process.env.VISUAL;
+		else process.env.VISUAL = saved;
+	}
+});

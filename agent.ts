@@ -1,12 +1,14 @@
 import { setTimeout as sleep } from "node:timers/promises";
-import { type TreeRange, changedBetween, dirsContaining, repoRoot, snapshotTree } from "./git.ts";
+import { type TreeRange, changedBetween, dirsContaining, findRepoRoot, snapshotTree } from "./git.ts";
 import type { EventContext, ExtensionApi } from "./host.ts";
+import { safeText } from "./safe.ts";
 
 /**
- * Which files did the agent change? Take a whole-working-tree snapshot (a git tree id) when each agent
- * loop starts and ends, and diff the two. That catches edits made by any tool, including bash and
- * formatters, and ignores what the user did between loops. Each loop is persisted in the session, so
- * the record survives a resume as long as git still has the tree objects.
+ * Which files did the agent change? Snapshot the whole working tree (a git tree id) before each agent loop and
+ * when it ends, and diff the two. That catches edits made by any tool, including bash and formatters, and leaves
+ * out what the user did between loops. The "before" snapshot is taken in before_agent_start, ahead of the agent's
+ * first edit, or at agent_start for loops no prompt started. Each loop is persisted in the session, so the record
+ * survives a resume as long as git still has the tree objects.
  */
 
 const ENTRY_TYPE = "lens.agent-turn";
@@ -49,38 +51,55 @@ export interface AgentScope {
 }
 
 export interface AgentChanges {
-	/** The agent's most recent loop. */
+	/** The agent's most recent loop that changed files. */
 	last?: AgentScope;
 	/** Net change since the session's first recorded loop. */
 	session?: AgentScope;
+	/** Why the latest loop could not be tracked, if it could not. */
+	error?: string;
+	/** Why the session scope could not be computed, if it could not. */
+	sessionError?: string;
 }
 
-type Start = Promise<{ root: string; tree: string } | undefined>;
+/** A snapshot, or why there is none (undefined: not in a repository). */
+type Start = Promise<{ root: string; tree: string } | { error: string } | undefined>;
 
 interface Tracker {
 	/** Snapshot taken before a prompt's agent loop, waiting for that loop's agent_start, and when it was taken. */
 	prepared: { start: Start; at: number } | undefined;
-	/** Snapshot taken when the current agent loop started. */
+	/** Snapshot the current loop is diffed against: the one prepared before the prompt, or one taken at agent_start. */
 	started: Start | undefined;
 	turns: TurnRecord[];
 	/** Net files changed from the first loop's start to the last loop's end, limited to files some loop touched. */
 	sessionFiles: Map<string, string>;
-	/** Settles when the bookkeeping for the latest event has finished. */
+	/** Why the latest loop was not recorded; cleared by the next loop that is. */
+	error?: string;
+	/** Why `sessionFiles` could not be computed. */
+	sessionError?: string;
+	/** Settles when the bookkeeping for the latest event has finished. Never rejects. */
 	pending: Promise<void>;
 }
 
-const emptyTracker = (turns: TurnRecord[] = []): Tracker => ({ prepared: undefined, started: undefined, turns, sessionFiles: new Map(), pending: Promise.resolve() });
+const emptyTracker = (turns: TurnRecord[] = [], pending: Promise<void> = Promise.resolve()): Tracker => ({
+	prepared: undefined,
+	started: undefined,
+	turns,
+	sessionFiles: new Map(),
+	pending,
+});
+
+const errorText = (err: unknown): string => safeText(err instanceof Error ? err.message.split("\n")[0] : String(err));
 
 let tracker: Tracker = emptyTracker();
 
-/** Snapshot the repository containing `cwd`; undefined outside one or on a git failure. */
+/** Snapshot the repository containing `cwd`; undefined outside one. Never rejects: a git failure comes back as `error`. */
 async function snapshotAt(cwd: string): Start {
-	const root = await repoRoot(cwd);
-	if (!root) return undefined;
 	try {
+		const root = await findRepoRoot(cwd);
+		if (!root) return undefined;
 		return { root, tree: await snapshotTree(root) };
-	} catch {
-		return undefined;
+	} catch (err) {
+		return { error: errorText(err) };
 	}
 }
 
@@ -98,48 +117,66 @@ export function agentSessionFiles(net: Map<string, string>, turns: readonly { fi
 	return new Map([...net].filter(([path]) => touched.has(path)));
 }
 
-async function recomputeSession(): Promise<void> {
-	const first = tracker.turns[0];
-	const last = tracker.turns[tracker.turns.length - 1];
-	if (!first || !last) {
-		tracker.sessionFiles = new Map();
-		return;
-	}
+async function recomputeSession(t: Tracker): Promise<void> {
+	const first = t.turns[0];
+	const last = t.turns[t.turns.length - 1];
+	t.sessionFiles = new Map();
+	t.sessionError = undefined;
+	if (!first || !last) return;
 	try {
-		tracker.sessionFiles = agentSessionFiles(await changedBetween(last.root, first.from, last.to), tracker.turns);
-	} catch {
-		tracker.sessionFiles = new Map(); // tree objects were garbage-collected
+		t.sessionFiles = agentSessionFiles(await changedBetween(last.root, first.from, last.to), t.turns);
+	} catch (err) {
+		t.sessionError = errorText(err); // e.g. git pruned the tree objects
 	}
 }
 
-async function finishLoop(pi: ExtensionApi, started: Tracker["started"]): Promise<void> {
-	const begin = await started;
-	if (!begin) return;
+/**
+ * Record the loop that `started` began, into `t`. Best-effort: a git failure must never disturb the session, so it
+ * is kept as `t.error` for /lens to show. If the session changed meanwhile (`t` is no longer current), the record
+ * belongs to no session and is dropped.
+ */
+async function finishLoop(pi: ExtensionApi, t: Tracker, started: Tracker["started"]): Promise<void> {
 	try {
+		const begin = await started;
+		if (!begin) return;
+		if ("error" in begin) throw new Error(begin.error);
 		const to = await snapshotTree(begin.root);
+		if (tracker !== t) return;
+		t.error = undefined;
 		if (to === begin.tree) return; // the loop changed no files
 		const files = [...(await changedBetween(begin.root, begin.tree, to))];
+		if (tracker !== t) return;
 		const record: TurnRecord = { root: begin.root, from: begin.tree, to, files };
-		tracker.turns.push(record);
+		t.turns.push(record);
 		pi.appendEntry(ENTRY_TYPE, record);
-		await recomputeSession();
-	} catch {
-		// tracking is best-effort: a git failure must never disturb the session
+		await recomputeSession(t);
+	} catch (err) {
+		t.error = errorText(err);
 	}
+}
+
+/** Start over from the turns recorded on the session's current branch. */
+function loadSession(ctx: EventContext): void {
+	const records = ctx.sessionManager
+		.getBranch()
+		.filter(entry => entry.type === "custom" && entry.customType === ENTRY_TYPE)
+		.map(entry => entry.data)
+		.filter(isTurnRecord);
+	const t = emptyTracker(records);
+	// Queue behind the old session's bookkeeping, so agentChanges() never answers from a half-built state.
+	t.pending = tracker.pending.then(() => recomputeSession(t));
+	tracker = t;
 }
 
 /** Start recording what the agent changes. */
 export function registerAgentTracking(pi: ExtensionApi): void {
-	pi.on("session_start", (_event, ctx) => {
-		if (!isMainSession(ctx)) return;
-		const records = ctx.sessionManager
-			.getBranch()
-			.filter(entry => entry.type === "custom" && entry.customType === ENTRY_TYPE)
-			.map(entry => entry.data)
-			.filter(isTurnRecord);
-		tracker = emptyTracker(records);
-		tracker.pending = recomputeSession();
-	});
+	// omp sends session_start once, at launch; /new, /resume and /fork send session_switch, and moving in the
+	// session tree sends session_branch or session_tree. Each leaves a different branch of recorded turns.
+	for (const event of ["session_start", "session_switch", "session_branch", "session_tree"] as const) {
+		pi.on(event, (_event, ctx) => {
+			if (isMainSession(ctx)) loadSession(ctx);
+		});
+	}
 	// A snapshot started at agent_start races the agent's first edits, which could land in the "before" tree
 	// and be attributed to nobody. omp awaits before_agent_start before a prompt's loop begins, so take the
 	// snapshot there. (Not in a tool_call handler: registering one turns off omp's speculative tool execution.)
@@ -158,18 +195,25 @@ export function registerAgentTracking(pi: ExtensionApi): void {
 	});
 	pi.on("agent_end", (_event, ctx) => {
 		if (!isMainSession(ctx)) return;
-		const started = tracker.started; // capture now: a new loop may start before this one finishes
-		tracker.started = undefined;
-		tracker.pending = tracker.pending.then(() => finishLoop(pi, started));
+		const t = tracker; // capture now: a new loop, or a new session, may start before this one finishes
+		const started = t.started;
+		t.started = undefined;
+		t.pending = t.pending.then(() => finishLoop(pi, t, started));
 	});
+}
+
+/** Settles once any in-flight bookkeeping (such as the agent's "after" snapshot) has finished. */
+export async function agentIdle(): Promise<void> {
+	await tracker.pending;
 }
 
 /** What the agent has changed so far, once any in-flight bookkeeping has finished. */
 export async function agentChanges(): Promise<AgentChanges> {
 	await tracker.pending;
+	const { error, sessionError } = tracker;
 	const first = tracker.turns[0];
 	const last = tracker.turns[tracker.turns.length - 1];
-	if (!first || !last) return {};
+	if (!first || !last) return { error };
 	const files = new Map(last.files);
 	const net = tracker.sessionFiles;
 	return {

@@ -1,9 +1,11 @@
 import { execFile } from "node:child_process";
-import { copyFile, lstat, mkdtemp, readFile, rm, stat, writeFile, mkdir } from "node:fs/promises";
+import { copyFile, lstat, mkdir, mkdtemp, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { safeText } from "./safe.ts";
 
 const MAX_BUFFER = 256 * 1024 * 1024;
+/** A file snapshotted on its own (outside a repo, or ignored by git) above this size is compared by size and mtime only. */
 const MAX_SNAPSHOT_FILE_BYTES = 2 * 1024 * 1024;
 /**
  * Untracked files larger than this are left out of working-tree snapshots: a stray dump or build artefact
@@ -19,13 +21,19 @@ export const MAX_UNTRACKED_SNAPSHOT_BYTES = 10 * 1024 * 1024;
  */
 export const GIT_SAFETY = ["-c", "core.quotepath=false", "-c", "core.fsmonitor=false"];
 
+/**
+ * Run git. A failure rejects with git's own first stderr line (made terminal-safe: it can quote file names and
+ * config), not node's "Command failed: <the whole command>". Messages are in English (LC_ALL=C) so they can be
+ * recognised.
+ */
 function run(cwd: string, args: string[], env: NodeJS.ProcessEnv, okCodes: number[]): Promise<string> {
 	const { promise, resolve, reject } = Promise.withResolvers<string>();
-	execFile("git", args, { cwd, env, maxBuffer: MAX_BUFFER, encoding: "utf8" }, (err, stdout) => {
+	execFile("git", args, { cwd, env: { ...env, LC_ALL: "C" }, maxBuffer: MAX_BUFFER, encoding: "utf8" }, (err, stdout, stderr) => {
 		if (!err) return resolve(stdout);
 		// A non-zero exit the caller declared acceptable (e.g. `diff --no-index` exits 1 on differences).
 		if (typeof err.code === "number" && okCodes.includes(err.code)) return resolve(stdout);
-		reject(err);
+		const reason = stderr.split("\n").find(line => line.trim() !== "")?.trim() ?? err.message.split("\n")[0];
+		reject(Object.assign(new Error(safeText(reason)), { code: err.code }));
 	});
 	return promise;
 }
@@ -64,18 +72,31 @@ async function git(cwd: string, args: string[], env: NodeJS.ProcessEnv = process
 
 export interface GitInfo {
 	root: string;
-	/** absolute path → one-letter status (M A D R ?) */
+	/** absolute path → one-letter status (M A D R C U T, ? for untracked) */
 	changed: Map<string, string>;
 	/** directories that contain at least one changed path */
 	dirty: Set<string>;
 }
 
-export async function repoRoot(dir: string): Promise<string | null> {
+/** The repository containing `dir`, null outside one. Throws when git itself fails (not installed, unreadable config). */
+export async function findRepoRoot(dir: string): Promise<string | null> {
 	try {
 		return (await git(dir, ["rev-parse", "--show-toplevel"])).trim() || null;
-	} catch {
-		return null;
+	} catch (err) {
+		// Outside a repository, or inside its .git directory: either way there is no working tree to snapshot.
+		if (/not a git repository|must be run in a work tree/i.test(String(err instanceof Error ? err.message : err))) return null;
+		throw err;
 	}
+}
+
+/** Like findRepoRoot, but any failure counts as "not in a repository". */
+export async function repoRoot(dir: string): Promise<string | null> {
+	return findRepoRoot(dir).catch(() => null);
+}
+
+/** True for a missing-file error; anything else (permissions, a directory) is a real failure. */
+export function isMissing(err: unknown): boolean {
+	return typeof err === "object" && err !== null && "code" in err && (err.code === "ENOENT" || err.code === "ENOTDIR");
 }
 
 /** Every directory from each path's parent up to and including `root`. Paths outside `root` contribute nothing. */
@@ -125,10 +146,14 @@ export async function gitInfo(root: string): Promise<GitInfo> {
 
 // ── Snapshots ─────────────────────────────────────────────────────────────
 
-export type Snapshot =
-	| { kind: "tree"; root: string; tree: string }
-	| { kind: "file"; path: string; before: Buffer | null }
-	| { kind: "none" };
+/** One file's state before an edit: its bytes (null when absent), or only size and mtime when it is too large to keep. */
+export type FileSnapshot = { path: string; before: Buffer | null } | { path: string; large: { size: number; mtimeMs: number } };
+
+/**
+ * The state before an edit. In a repository, the whole working tree plus the edited file on its own: git leaves
+ * ignored files (and large untracked ones) out of the tree, and their edits must still be reported.
+ */
+export type Snapshot = { kind: "tree"; root: string; tree: string; file: FileSnapshot } | { kind: "file"; file: FileSnapshot };
 
 export interface EditDiff {
 	files: { status: string; path: string }[];
@@ -137,6 +162,8 @@ export interface EditDiff {
 	patch: string;
 	/** Present for git snapshots: the two tree ids, usable with `git diff <from> <to>`. */
 	trees?: { from: string; to: string };
+	/** Why `patch` is missing a file's changes (it was too large to diff). */
+	omitted?: string;
 }
 
 /** Untracked (not ignored) files above `maxBytes`, repo-relative. */
@@ -180,7 +207,9 @@ export async function snapshotTree(root: string, maxUntrackedBytes = MAX_UNTRACK
 	const tmp = await mkdtemp(join(tmpdir(), "lens-index-"));
 	try {
 		const tmpIndex = join(tmp, "index");
-		await copyFile(indexPath, tmpIndex).catch(() => undefined); // a fresh repo has no index yet
+		await copyFile(indexPath, tmpIndex).catch(err => {
+			if (!isMissing(err)) throw err; // a fresh repo has no index yet
+		});
 		const env = { ...process.env, GIT_INDEX_FILE: tmpIndex };
 		const skip = [...(await largeUntracked(root, env, maxUntrackedBytes)), ...(await gitlinks(root, env))];
 		if (skip.length === 0) await git(root, ["add", "-A"], env);
@@ -196,22 +225,38 @@ export async function snapshotTree(root: string, maxUntrackedBytes = MAX_UNTRACK
 	}
 }
 
-export async function takeSnapshot(filePath: string): Promise<Snapshot> {
-	const root = await repoRoot(dirname(filePath));
-	if (root) return { kind: "tree", root, tree: await snapshotTree(root) };
+/** Read a file for a snapshot. Only a missing file counts as absent; other read errors are thrown. */
+async function snapshotFile(path: string): Promise<FileSnapshot> {
 	try {
-		const info = await stat(filePath);
-		if (info.size > MAX_SNAPSHOT_FILE_BYTES) return { kind: "none" };
-		return { kind: "file", path: filePath, before: await readFile(filePath) };
-	} catch {
-		return { kind: "file", path: filePath, before: null }; // file will be created
+		const info = await stat(path);
+		if (info.size > MAX_SNAPSHOT_FILE_BYTES) return { path, large: { size: info.size, mtimeMs: info.mtimeMs } };
+		return { path, before: await readFile(path) };
+	} catch (err) {
+		if (isMissing(err)) return { path, before: null }; // the edit will create it
+		throw err;
 	}
 }
 
+export async function takeSnapshot(filePath: string): Promise<Snapshot> {
+	// When git refuses the repository (an unreadable config, another user's repository), the file alone is still
+	// diffed: that diff runs in a temporary directory, away from the repository's config.
+	const root = await findRepoRoot(dirname(filePath)).catch(() => null);
+	// Resolve symlinks so the path matches what git reports for the tree diff.
+	const path = await realpath(filePath).catch(() => filePath);
+	if (!root) return { kind: "file", file: await snapshotFile(path) };
+	const [tree, file] = await Promise.all([snapshotTree(root), snapshotFile(path)]);
+	return { kind: "tree", root, tree, file };
+}
+
 export async function diffSince(snap: Snapshot): Promise<EditDiff | null> {
-	if (snap.kind === "tree") return diffTrees(snap.root, snap.tree);
-	if (snap.kind === "file") return diffFile(snap.path, snap.before);
-	return null;
+	if (snap.kind === "file") return diffFile(snap.file);
+	const tree = await diffTrees(snap.root, snap.tree);
+	if (tree?.files.some(f => f.path === snap.file.path)) return tree;
+	// The edited file is not in the tree diff: git ignores it, or it is a large untracked file.
+	const own = await diffFile(snap.file);
+	if (!own) return tree;
+	if (!tree) return own;
+	return { ...tree, files: [...tree.files, ...own.files], added: tree.added + own.added, removed: tree.removed + own.removed, patch: tree.patch + own.patch, omitted: own.omitted };
 }
 
 /**
@@ -262,13 +307,19 @@ async function diffTrees(root: string, from: string): Promise<EditDiff | null> {
 	return { files, added, removed, patch, trees: { from, to } };
 }
 
-async function diffFile(path: string, before: Buffer | null): Promise<EditDiff | null> {
-	let after: Buffer | null;
-	try {
-		after = await readFile(path);
-	} catch {
-		after = null;
+async function diffFile(snap: FileSnapshot): Promise<EditDiff | null> {
+	const path = snap.path;
+	const now = await snapshotFile(path);
+	if ("large" in snap || "large" in now) {
+		// Too large to diff: say whether it changed, by size and mtime.
+		const was = "large" in snap ? snap.large : snap.before && { size: snap.before.length, mtimeMs: -1 };
+		const is = "large" in now ? now.large : now.before && { size: now.before.length, mtimeMs: -1 };
+		if (was && is && was.size === is.size && was.mtimeMs === is.mtimeMs) return null;
+		const status = !was ? "A" : !is ? "D" : "M";
+		return { files: [{ status, path }], added: 0, removed: 0, patch: "", omitted: `${basename(path)} is over ${MAX_SNAPSHOT_FILE_BYTES / 1024 / 1024} MB` };
 	}
+	const before = snap.before;
+	const after = now.before;
 	if (before === null && after === null) return null;
 	if (before !== null && after !== null && before.equals(after)) return null;
 
@@ -297,15 +348,17 @@ async function diffFile(path: string, before: Buffer | null): Promise<EditDiff |
 
 /**
  * One file's unified diff: against HEAD (staged and unstaged), or between two snapshots (git tree ids) when `range` is given.
- * Empty when there is nothing to show, or in a repo without commits.
+ * Empty when there is nothing to show, or in a repo without commits. Throws when git fails.
  */
 export async function fileDiff(root: string, path: string, range?: { from: string; to: string }): Promise<string> {
 	const env = { ...process.env, GIT_OPTIONAL_LOCKS: "0" };
 	const revs = range ? [range.from, range.to] : ["HEAD"];
 	try {
 		return await git(root, ["diff", "--no-color", "--no-ext-diff", "--no-textconv", "--ignore-submodules=all", ...revs, "--", path], env);
-	} catch {
-		return "";
+	} catch (err) {
+		// No commits yet: nothing to diff against. Any other failure is the caller's to report.
+		if (!range && (await git(root, ["rev-parse", "--verify", "--quiet", "HEAD"], env, [0, 1]).catch(() => "x")) === "") return "";
+		throw err;
 	}
 }
 

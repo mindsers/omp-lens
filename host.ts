@@ -88,9 +88,13 @@ export interface ExtensionApi {
 	): unknown;
 	/**
 	 * Handlers are awaited, up to omp's handler timeout (30 s by default). `before_agent_start` runs before a
-	 * prompt's agent loop begins.
+	 * prompt's agent loop begins. `session_start` fires once at launch; `session_switch` (/new, /resume, /fork),
+	 * `session_branch` and `session_tree` fire after the session or branch has changed.
 	 */
-	on(event: "session_start" | "before_agent_start" | "agent_start" | "agent_end", handler: (event: unknown, ctx: EventContext) => void | Promise<void>): void;
+	on(
+		event: "session_start" | "session_switch" | "session_branch" | "session_tree" | "before_agent_start" | "agent_start" | "agent_end",
+		handler: (event: unknown, ctx: EventContext) => void | Promise<void>,
+	): void;
 	/** Persist `data` in the session under `customType`; it comes back through `sessionManager.getBranch()` on resume. */
 	appendEntry(customType: string, data: unknown): unknown;
 }

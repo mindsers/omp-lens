@@ -1,15 +1,22 @@
 import { realpath, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, resolve } from "node:path";
-import { agentChanges, registerAgentTracking } from "./agent.ts";
+import { type AgentChanges, agentChanges, registerAgentTracking } from "./agent.ts";
 import { completeArgs, parseArgs } from "./args.ts";
 import { type BrowserResult, type BrowserState, FileBrowser, newFinder } from "./browser.ts";
 import { editAndInform, registerEditRenderer } from "./editmode.ts";
 import type { CommandContext, ExtensionApi, Tui } from "./host.ts";
 import { reference } from "./refs.ts";
 
+/** Why `/lens changes [session]` has nothing to show. */
+export function noAgentScope(agent: AgentChanges, scope: "last" | "session"): string {
+	if (!agent.last) return agent.error ? `Agent-change tracking failed: ${agent.error}` : "No agent changes recorded yet (they are tracked in git repositories).";
+	if (scope === "session" && agent.sessionError) return `The session's agent diff is unavailable (git may have pruned its snapshots): ${agent.sessionError}`;
+	return "The agent has no net changes this session.";
+}
+
 /** Apply `/lens …` arguments to a fresh browser state. Returns false (after saying why) when they cannot be honoured. */
-async function applyArgs(raw: string, state: BrowserState, cwd: string, ctx: CommandContext): Promise<boolean> {
+export async function applyArgs(raw: string, state: BrowserState, cwd: string, ctx: CommandContext): Promise<boolean> {
 	const args = parseArgs(raw);
 	switch (args.kind) {
 		case "browse":
@@ -26,10 +33,7 @@ async function applyArgs(raw: string, state: BrowserState, cwd: string, ctx: Com
 		case "changes": {
 			const agent = await agentChanges();
 			if (!agent[args.scope]) {
-				ctx.ui.notify(
-					agent.last ? "The agent has no net changes this session." : "No agent changes recorded yet (they are tracked in git repositories).",
-					"warning",
-				);
+				ctx.ui.notify(noAgentScope(agent, args.scope), "warning");
 				return false;
 			}
 			state.agentScope = args.scope;

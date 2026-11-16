@@ -34,7 +34,8 @@ Subcommands complete with Tab. To open a folder named like a subcommand, write `
 
 - **Browse** folders with a preview pane: syntax-highlighted source, rendered Markdown, indented JSON, image
   size, directory contents. On narrow terminals the preview moves below the list; on tiny ones it is hidden.
-- **Git aware**: `M A D R ?` markers on files, `*` on folders that contain changes, a changed-only filter, and
+- **Git aware**: status markers on files (`M` modified, `A` added, `D` deleted, `R` renamed, `?` untracked, and
+  git's rarer `C` `U` `T`), `*` on folders that contain changes, a changed-only filter, and
   the diff against HEAD.
 - **Hand context to the agent**: insert `@path` for a file or marked files, or `@path#L12-20` for a line range
   chosen in the preview.
@@ -55,9 +56,8 @@ In the file list:
 |---|---|
 | `↑` `↓` / `j` `k` | Move |
 | `←` / `h` / `Backspace` | Up one folder |
-| `→` / `l` | Open a folder, or a file in the preview |
-| `Enter` | Open a folder, or a file in the preview (line mode) |
-| `i` | Insert `@path` for the marked files, or the selected one |
+| `→` / `l` / `Enter` | Open a folder, or put the cursor in a file's preview (line mode) |
+| `i` | Insert `@path` for the marked files, or the selected one (`@path#L…` for a text-search hit) |
 | `Space` | Mark or unmark a file |
 | `e` | Edit in your editor |
 | `Tab` | Line cursor in the preview |
@@ -83,7 +83,7 @@ In line mode (the preview has the cursor):
 | `Space` or `v` | Start or end a range selection |
 | `Enter` / `i` | Insert `@path#L…` for the line or range |
 | `e` | Edit at the cursor line |
-| `Tab` / `Esc` / `←` | Back to the list |
+| `Tab` / `Esc` / `←` / `h` / `q` | Back to the list (`Esc` first cancels a range selection) |
 
 Keys that are unavailable right now (for example `g` outside a git repository) are hidden from the hint bar;
 pressing them says why.
@@ -96,20 +96,25 @@ pressing them says why.
 3. The tree is snapshotted again and diffed. Changes (or none) are reported; a notice is added to the
    conversation for the agent's next turn, with the full diff, or the file list and tree ids if it is large.
 
-It refuses to start while the agent is working. Outside a git repository only the file you opened is diffed.
+It refuses to start while the agent is working. The file you open is also snapshotted on its own, so editing a
+gitignored file (or a large untracked one) is still reported. Outside a git repository only that file is
+diffed. A file snapshotted on its own that is over 2 MB is compared by size and modification time: the agent
+is told it changed and to re-read it, without a diff.
 The snapshots add unreferenced objects to `.git/objects`, which `git gc` prunes. Untracked files over 10 MB are
 left out of snapshots, so they are neither hashed nor reported (one that grows past 10 MB between two
 snapshots shows as deleted).
 
-**What reaches the agent:** the diff covers every tracked and untracked file that is not gitignored. Gitignored
-files are never included, but a secrets file you have not ignored yet (`.env.local`, a key) is, if it changes
+**What reaches the agent:** the diff covers every tracked and untracked file that is not gitignored, plus the
+file you opened even if it is gitignored. So editing `.env` with `e` sends its diff to the agent; edit secrets
+outside omp. Any other secrets file you have not ignored yet (`.env.local`, a key) is included too if it changes
 while your editor is open. Add such files to `.gitignore`.
 
 ## Requirements and limits
 
 - `git` for markers, diffs, agent tracking and in-repo find. `rg` is used for text search outside a repo if
   installed; otherwise `find` and `grep`.
-- Opening at a line works for vi, vim, nvim, nano, emacs, micro, kak, hx, subl, zed and VS Code's family. Other
+- Opening at a line works for vi, vim, nvim, view, vimx, nano, emacs, emacsclient, micro, kak, hx, subl, zed, xed
+  and VS Code's family. Other
   editors open the file without a line. Only nvim has been tested.
 - GUI editors (VS Code's family, subl, zed, xed) get `--wait` added unless your `$EDITOR` already has `--wait`
   or `-w`, so the plugin waits for you to close the file before diffing.
@@ -121,14 +126,17 @@ while your editor is open. Add such files to `.gitignore`.
 - Rendered Markdown and indented JSON are view-only: their rows are not lines of the file, so they cannot
   produce line references.
 - Agent tracking records what changed, not what the agent read, and relies on git keeping its snapshot objects.
+  It follows the session: `/new`, `/resume`, `/fork` and moving in the session tree show that session's turns.
+  If tracking fails (git missing, an unreadable config), `/lens changes` and the browser say so.
   Each prompt's "before" snapshot is taken before the agent starts (omp waits for it, up to 10 s), so the
   agent's first edits are not missed. In a huge repository that can delay the start of a turn. The 10 s limit
   assumes omp's default extension handler timeout (30 s); with a lower `extensionHandlerTimeout`, a slow snapshot
   is abandoned sooner.
 - Special files (named pipes, devices, sockets) are listed but not previewed.
+- Text search takes a fixed string, not a regex, and ignores case unless the query has a capital letter. It stops
+  after 2,000 lines of output or 15 s; the hit count then ends in `+`, and `(timed out)` says when time ran out.
 - Outside a git repository, find skips hidden entries and `node_modules`, `dist`, `build`, `target`, `venv`,
-  `__pycache__`, `site-packages` and `coverage`, and lists at most 50,000 files. Text search takes a fixed
-  string, not a regex, and ignores case unless the query has a capital letter.
+  `__pycache__`, `site-packages` and `coverage`, and lists at most 50,000 files.
 
 ## Security
 
@@ -140,6 +148,8 @@ while your editor is open. Add such files to `.gitignore`.
   repository's config cannot be read, the plugin runs no git command there. Submodules are not looked inside
   (their own config would apply there), so changes within a submodule get no marker.
   git's own `safe.directory` check still refuses repositories owned by another user.
+
+Found a vulnerability? Report it privately: see [SECURITY.md](SECURITY.md).
 
 ## Development
 

@@ -10,6 +10,12 @@ test("files inside the working directory are mentioned by relative path", () => 
 test("files outside the working directory keep their absolute path", () => {
 	expect(reference({ path: "/other/place/x.ts" }, cwd)).toBe("@/other/place/x.ts");
 	expect(reference({ path: "/work/repo-sibling/x.ts" }, cwd)).toBe("@/work/repo-sibling/x.ts");
+	expect(reference({ path: "/work/x.ts" }, cwd)).toBe("@/work/x.ts");
+});
+
+test("a name that merely starts with '..' is still inside the working directory", () => {
+	expect(reference({ path: "/work/repo/..notes" }, cwd)).toBe("@..notes");
+	expect(reference({ path: "/work/repo/..d/x.ts" }, cwd)).toBe("@..d/x.ts");
 });
 
 test("a single line and a line range", () => {

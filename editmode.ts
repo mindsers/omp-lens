@@ -1,10 +1,11 @@
 import { spawnSync } from "node:child_process";
-import { relative } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import { Text } from "@oh-my-pi/pi-tui";
+import { agentIdle } from "./agent.ts";
 import { editorCommand } from "./editor-args.ts";
 import { type EditDiff, type Snapshot, diffSince, takeSnapshot } from "./git.ts";
 import type { CommandContext, ExtensionApi, Tui } from "./host.ts";
+import { displayPath } from "./refs.ts";
 import { safeText } from "./safe.ts";
 
 const MAX_PATCH_CHARS = 50_000;
@@ -12,19 +13,21 @@ const EDIT_MESSAGE_TYPE = "lens.user-edit";
 const SUMMARY_PREFIX = "Changed files ";
 
 function errorText(err: unknown): string {
-	return err instanceof Error ? err.message.split("\n")[0] : String(err);
+	return safeText(err instanceof Error ? err.message.split("\n")[0] : String(err));
 }
 
 function describe(diff: EditDiff, cwd: string): string {
-	const list = diff.files.map(f => `${f.status} ${relative(cwd, f.path) || f.path}`).join(", ");
+	const list = diff.files.map(f => `${f.status} ${displayPath(f.path, cwd)}`).join(", ");
 	const header = [
 		"The user edited files directly in their own editor, outside your tools.",
 		"Treat the result as the current state. Re-read a file before editing it: line anchors from earlier reads may be stale.",
 		"",
 		`${SUMMARY_PREFIX}(${diff.files.length}, +${diff.added} -${diff.removed}): ${list}`,
 	];
+	const omitted = diff.omitted ? [`Not diffed: ${diff.omitted}. Read the file.`] : [];
+	if (diff.patch.trim() === "") return [...header, "", ...omitted].join("\n");
 	if (diff.patch.length <= MAX_PATCH_CHARS) {
-		return [...header, "", "```diff", diff.patch.trimEnd(), "```"].join("\n");
+		return [...header, "", "```diff", diff.patch.trimEnd(), "```", ...omitted].join("\n");
 	}
 	const inspect = diff.trees ? `Diff omitted (${diff.patch.length} chars). Inspect with: git diff ${diff.trees.from} ${diff.trees.to}` : `Diff omitted (${diff.patch.length} chars). Read the file.`;
 	return [...header, "", inspect].join("\n");
@@ -63,6 +66,8 @@ export async function editAndInform(pi: ExtensionApi, ctx: CommandContext, tui: 
 		return false;
 	}
 
+	// The agent's last loop may still be taking its "after" snapshot: let it finish, or the user's edit lands in it.
+	await agentIdle();
 	let before: Snapshot;
 	try {
 		before = await takeSnapshot(filePath);

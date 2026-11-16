@@ -5,13 +5,13 @@ import { matchesKey, truncateToWidth, visibleWidth, wrapTextWithAnsi } from "@oh
 import type { AgentChanges, AgentScope } from "./agent.ts";
 import { parseGrep, rankFiles } from "./find.ts";
 import { type Entry, formatSize, listDirectory } from "./fsx.ts";
-import { type GitInfo, type TreeRange, gitInfo, listFiles, repoRoot } from "./git.ts";
+import { type GitInfo, type TreeRange, findRepoRoot, gitInfo, listFiles } from "./git.ts";
 import type { Component, Theme, Tui } from "./host.ts";
 import { lineRange, nearestLineNo } from "./lines.ts";
 import { type Preview, type PreviewMode, isMarkdown, loadPreview } from "./preview.ts";
 import { safeText } from "./safe.ts";
 import type { FileRef } from "./refs.ts";
-import { grepText, walkFiles } from "./search.ts";
+import { type GrepResult, grepText, walkFiles } from "./search.ts";
 
 /** Which version of a file the preview shows. */
 export type PreviewView = "file" | "diff" | "agent";
@@ -111,6 +111,8 @@ interface DisplayRow {
 	first: boolean;
 }
 
+const errorText = (err: unknown): string => safeText(err instanceof Error ? err.message.split("\n")[0] : String(err));
+
 export class FileBrowser implements Component {
 	private all: Entry[] = [];
 	private view: Entry[] = [];
@@ -173,25 +175,42 @@ export class FileBrowser implements Component {
 		private readonly isIdle: () => boolean,
 		private readonly agent: AgentChanges,
 	) {
+		// The agent changes were fetched afresh: a scope kept from the last opening may no longer exist.
+		if (state.agentScope !== "off" && !agent[state.agentScope]) {
+			state.agentScope = "off";
+			if (state.view === "agent") state.view = "file";
+		}
 		void warmHighlighter(); // build grammars off the render path so the first preview is not slow
-		void this.load(state.path, state.selectedName).then(() => this.resumeFinder());
+		void this.load(state.path, state.selectedName).then(() => {
+			if (agent.error && !this.flash) {
+				this.flash = `agent-change tracking failed: ${agent.error}`;
+				this.tui.requestRender();
+			}
+			this.resumeFinder();
+		});
 	}
 
 	invalidate(): void {}
 
 	// ── Loading ───────────────────────────────────────────────────────────
 
-	private async gitFor(dir: string): Promise<GitInfo | null> {
-		const root = await repoRoot(dir);
-		if (!root) return null;
+	/** Git status for the repository containing `dir` (null outside one), and why it failed if it did. */
+	private async gitFor(dir: string): Promise<{ info: GitInfo | null; error?: string }> {
+		let root: string | null;
+		try {
+			root = await findRepoRoot(dir);
+		} catch (err) {
+			return { info: null, error: `git failed: ${errorText(err)}` };
+		}
+		if (!root) return { info: null };
 		const cached = this.gitByRoot.get(root);
-		if (cached && Date.now() - cached.at < GIT_TTL_MS) return cached.info;
+		if (cached && Date.now() - cached.at < GIT_TTL_MS) return { info: cached.info };
 		try {
 			const info = await gitInfo(root);
 			this.gitByRoot.set(root, { info, at: Date.now() });
-			return info;
-		} catch {
-			return cached?.info ?? null;
+			return { info };
+		} catch (err) {
+			return { info: cached?.info ?? null, error: `git status failed${cached ? " (showing older status)" : ""}: ${errorText(err)}` };
 		}
 	}
 
@@ -203,9 +222,9 @@ export class FileBrowser implements Component {
 			const [entries, git] = await Promise.all([listDirectory(dir, this.state.showHidden), this.gitFor(dir)]);
 			if (seq !== this.seq) return;
 			this.all = entries;
-			this.git = git;
+			this.git = git.info;
 			this.state.path = dir;
-			this.flash = "";
+			this.flash = git.error ?? "";
 			this.query = "";
 			this.searching = false;
 			this.focus = "list";
@@ -564,8 +583,19 @@ export class FileBrowser implements Component {
 		const seq = ++this.finderSeq;
 		let files = this.repoFiles.get(root);
 		if (!files) {
-			if (this.git) files = await listFiles(root).catch(() => []);
-			else {
+			if (this.git) {
+				try {
+					files = await listFiles(root);
+				} catch (err) {
+					// Not cached: the next keystroke tries again.
+					if (seq !== this.finderSeq || this.finder !== finder) return;
+					finder.results = [];
+					finder.note = `cannot list files: ${errorText(err)}`;
+					this.applyView();
+					this.tui.requestRender();
+					return;
+				}
+			} else {
 				const walked = await walkFiles(root);
 				files = walked.files;
 				if (walked.partial) this.partialRoots.add(root);
@@ -589,8 +619,16 @@ export class FileBrowser implements Component {
 		const seq = ++this.finderSeq;
 		finder.note = "searching…";
 		this.tui.requestRender();
-		const { hits, capped } = parseGrep(await grepText(root, finder.query, this.git !== null), MAX_FIND_RESULTS);
+		let result: GrepResult;
+		try {
+			result = await grepText(root, finder.query, this.git !== null);
+		} catch (err) {
+			result = { out: "", partial: false, timedOut: false, error: errorText(err) };
+		}
 		if (seq !== this.finderSeq || this.finder !== finder) return;
+		const parsed = parseGrep(result.out, MAX_FIND_RESULTS);
+		const { hits } = parsed;
+		const capped = parsed.capped || result.partial;
 		finder.results = hits.map(h => ({
 			name: `${h.path}:${h.line}`,
 			path: join(root, h.path),
@@ -599,7 +637,8 @@ export class FileBrowser implements Component {
 			mtimeMs: 0,
 			hit: { line: h.line, text: h.text },
 		}));
-		finder.note = `${hits.length === 0 ? "no matches" : `${hits.length}${capped ? "+" : ""} hits`}${this.scopeNote(root)}`;
+		const count = result.error ? `search failed: ${result.error}` : hits.length === 0 ? "no matches" : `${hits.length}${capped ? "+" : ""} hits`;
+		finder.note = `${count}${result.timedOut ? " (timed out)" : ""}${this.scopeNote(root)}`;
 		this.applyView(select);
 		this.tui.requestRender();
 	}
@@ -719,7 +758,7 @@ export class FileBrowser implements Component {
 			{
 				keys: "a",
 				label: { off: "all files", last: "agent last turn", session: "agent session" }[this.nextScope()],
-				off: this.agent.last ? undefined : "no agent changes recorded yet (needs a git repository)",
+				off: this.agent.last ? undefined : this.agent.error ? `agent-change tracking failed: ${this.agent.error}` : "no agent changes recorded yet (needs a git repository)",
 			},
 			{ keys: "f", label: "find files" },
 			{ keys: "s", label: "search text" },
@@ -1014,7 +1053,7 @@ export class FileBrowser implements Component {
 		const list: string[] = [];
 		const finder = this.finder;
 		const filtering = finder !== undefined || this.searching || this.query !== "";
-		if (finder) list.push(this.cell(` ${t.fg("accent", finder.kind === "files" ? "find" : "text")} ${finder.query}${finder.typing ? "█" : ""}  ${t.fg("dim", finder.note)}`, lw));
+		if (finder) list.push(this.cell(` ${t.fg("accent", finder.kind === "files" ? "find" : "text")} ${safeText(finder.query)}${finder.typing ? "█" : ""}  ${t.fg("dim", safeText(finder.note))}`, lw));
 		else if (filtering) list.push(this.cell(` ${t.fg("accent", "/")} ${this.query}${this.searching ? "█" : ""}`, lw));
 		const visible = this.view.slice(this.top, this.top + rows);
 		if (this.loading && this.view.length === 0) list.push(this.cell(t.fg("muted", " loading…"), lw));

@@ -168,17 +168,21 @@ function diffPreview(patch: string, label: string, path: string, theme: Theme): 
 export async function loadPreview(entry: Entry, mode: PreviewMode, theme: Theme, gitRoot: string | null, agent?: TreeRange): Promise<Preview> {
 	try {
 		if (entry.isDirectory) return await directoryPreview(entry, theme);
-		if (mode === "agent" && agent) {
-			const patch = (await fileDiff(agent.root, entry.path, agent)).trimEnd();
-			const diff = patch ? diffPreview(patch, agent.label, entry.path, theme) : undefined;
-			if (diff) return diff;
-		}
-		if (mode === "diff" && gitRoot) {
-			const patch = (await fileDiff(gitRoot, entry.path)).trimEnd();
-			const diff = patch ? diffPreview(patch, "diff vs HEAD", entry.path, theme) : undefined;
-			if (diff) return diff;
-		}
-		return await fileContent(entry, mode, theme);
+		// A diff that fails falls back to the file's content, saying so; an empty one (no change) falls back quietly.
+		let failed = "";
+		const diffOf = async (root: string, label: string, range?: TreeRange): Promise<Preview | undefined> => {
+			try {
+				const patch = (await fileDiff(root, entry.path, range)).trimEnd();
+				return patch ? diffPreview(patch, label, entry.path, theme) : undefined;
+			} catch (err) {
+				failed = `diff unavailable: ${err instanceof Error ? err.message.split("\n")[0] : String(err)} · `;
+				return undefined;
+			}
+		};
+		const diff = mode === "agent" && agent ? await diffOf(agent.root, agent.label, agent) : mode === "diff" && gitRoot ? await diffOf(gitRoot, "diff vs HEAD") : undefined;
+		if (diff) return diff;
+		const content = await fileContent(entry, mode, theme);
+		return failed ? { ...content, note: safeText(failed) + content.note } : content;
 	} catch (err) {
 		return plain([], safeText(`cannot read: ${err instanceof Error ? err.message : String(err)}`));
 	}
